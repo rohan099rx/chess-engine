@@ -24,6 +24,16 @@ Controls (Pygame):
 - `F`: flip board
 - `R`: reset
 
+Troubleshooting:
+
+- If you see `No module named 'pygame'`, make sure you installed dependencies into the same environment you're running:
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python main.py
+```
+
 Run tests:
 
 ```bash
