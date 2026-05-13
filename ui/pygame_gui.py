@@ -98,7 +98,11 @@ class PygameChessGUI:
         self._ai_best_move: tuple[tuple[int, int], tuple[int, int], str | None] | None = None
 
         self._analysis_lock = threading.Lock()
+        self._analysis_state_lock = threading.Lock()
         self._analysis_thinking = False
+        self._analysis_pending = False
+        self._analysis_pending_gen = 0
+        self._analysis_pending_snapshot: dict | None = None
         self._analysis_eval = 0.0
         self._analysis_lines: list[tuple[str, float]] = []  # list[(san, score)] white-perspective
 
@@ -292,31 +296,47 @@ class PygameChessGUI:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _score_to_ratio(score: float) -> float:
-        # Map pawns to a 0..1 bar. Clamp mates to extremes.
+    def _score_to_norm(score: float) -> float:
+        """Normalize a pawn eval to [-1, 1] for UI.
+
+        Uses tanh so large evals saturate smoothly, and mates clamp.
+        """
         if score >= 900:
             return 1.0
         if score <= -900:
-            return 0.0
-        return 0.5 + 0.5 * math.tanh(score / 4.0)
+            return -1.0
+        return float(math.tanh(score / 4.0))
+
+    @classmethod
+    def _score_to_ratio(cls, score: float) -> float:
+        # Convert normalized [-1,1] to bar ratio [0,1] where 1=white.
+        n = cls._score_to_norm(score)
+        return 0.5 + 0.5 * n
 
     @staticmethod
     def _format_score(score: float) -> str:
-        if score >= 900:
+        # Display normalized eval in [-1,1]
+        if abs(score) >= 900:
             return "#"
-        if score <= -900:
-            return "#"
-        return f"{score:+.2f}"
+        n = float(math.tanh(score / 4.0))
+        n = max(-1.0, min(1.0, n))
+        return f"{n:+.2f}"
 
     def _start_analysis(self):
-        if self._analysis_thinking:
-            return
         if self.pending_promotion is not None:
             return
 
         gen = self._position_generation
         snapshot = self._capture_position()
-        self._analysis_thinking = True
+        with self._analysis_state_lock:
+            if self._analysis_thinking:
+                self._analysis_pending = True
+                self._analysis_pending_gen = gen
+                self._analysis_pending_snapshot = snapshot
+                return
+
+            self._analysis_thinking = True
+
         t = threading.Thread(target=self._analysis_worker, args=(gen, snapshot), daemon=True)
         t.start()
 
@@ -360,13 +380,54 @@ class PygameChessGUI:
                         if promo:
                             san += promo.lower()
                     lines.append((san, float(score)))
+            else:
+                # Fallback: score a handful of legal moves quickly (still multi-move suggestions).
+                is_white = b.turn == "white"
+                moves = mg.generate_all_legal_moves(is_white)
+                scored = []
+                for (start, end, promo) in moves[:20]:
+                    state = b.make_move(start, end, promo)
+                    try:
+                        s = float(mg.evaluate_position())
+                    finally:
+                        b.undo_move(start, end, state)
+
+                    scored.append(((start, end, promo), s))
+
+                scored.sort(key=lambda ms: ms[1] if is_white else -ms[1], reverse=True)
+                for (move, s) in scored[:8]:
+                    start, end, promo = move
+                    try:
+                        san = move_to_san(b, mg, start, end, promo)
+                    except Exception:
+                        san = f"{b.square_to_algebraic(start[0], start[1])}{b.square_to_algebraic(end[0], end[1])}"
+                        if promo:
+                            san += promo.lower()
+                    lines.append((san, float(s)))
 
             # Apply results if still current
             if gen == self._position_generation:
                 self._analysis_eval = eval_now
                 self._analysis_lines = lines
 
-            self._analysis_thinking = False
+            with self._analysis_state_lock:
+                self._analysis_thinking = False
+                pending = self._analysis_pending
+                pending_gen = self._analysis_pending_gen
+                pending_snapshot = self._analysis_pending_snapshot
+                self._analysis_pending = False
+                self._analysis_pending_snapshot = None
+
+            if pending and pending_snapshot is not None and pending_gen != gen:
+                with self._analysis_state_lock:
+                    if not self._analysis_thinking:
+                        self._analysis_thinking = True
+                        t = threading.Thread(
+                            target=self._analysis_worker,
+                            args=(pending_gen, pending_snapshot),
+                            daemon=True,
+                        )
+                        t.start()
 
     def _start_ai_if_needed(self):
         if self._ai_thinking:
@@ -404,10 +465,12 @@ class PygameChessGUI:
                 return
 
             depth = self._difficulty_to_depth()
+            # Time cap keeps the UI responsive while still letting iterative deepening find tactics.
+            max_time = 0.25 + 0.25 * max(0, (self.difficulty - 1))
             best_move, _score = mg.find_best_move(
                 depth=depth,
                 is_white_turn=ai_is_white,
-                max_time=None,
+                max_time=max_time,
                 verbose=False,
                 use_book=True,
             )
@@ -464,6 +527,18 @@ class PygameChessGUI:
                 rect = pygame.Rect(x, y, self.square_size, self.square_size)
                 base = light if (row + col) % 2 == 0 else dark
                 pygame.draw.rect(self.screen, base, rect)
+
+                # Coordinate labels (like chess.com): files on the visual bottom rank, ranks on the visual left file.
+                show_file = (not self.flipped and row == 7) or (self.flipped and row == 0)
+                show_rank = (not self.flipped and col == 0) or (self.flipped and col == 7)
+                if show_file:
+                    file_ch = chr(ord('a') + col)
+                    txt = self.font_small.render(file_ch, True, (90, 95, 110))
+                    self.screen.blit(txt, (x + self.square_size - txt.get_width() - 4, y + self.square_size - txt.get_height() - 2))
+                if show_rank:
+                    rank_ch = str(8 - row)
+                    txt = self.font_small.render(rank_ch, True, (90, 95, 110))
+                    self.screen.blit(txt, (x + 4, y + 2))
 
         # Last move highlight
         if self.last_move is not None:
@@ -536,13 +611,19 @@ class PygameChessGUI:
         title = self.font.render("SUGGESTED MOVES", True, (230, 230, 236))
         self.screen.blit(title, (sidebar_x + 12, 10))
 
+        # Normalized eval display in [-1, 1]
+        eval_norm = self._score_to_norm(self._analysis_eval)
+        eval_norm = max(-1.0, min(1.0, eval_norm))
+        eval_line = self.font_small.render(f"Eval: {eval_norm:+.2f}", True, (170, 175, 190))
+        self.screen.blit(eval_line, (sidebar_x + 12, 38))
+
         if self._analysis_thinking:
-            note = self.font_small.render("Analyzing…", True, (170, 175, 190))
-            self.screen.blit(note, (sidebar_x + 12, 38))
+            note = self.font_small.render("Analyzing…", True, (150, 155, 170))
+            self.screen.blit(note, (sidebar_x + 140, 38))
 
         y = 66
         for idx, (san, score) in enumerate(self._analysis_lines[:8], 1):
-            line = f"{idx}. {san:<8}  {self._format_score(score):>6}"
+            line = f"{idx}. {san:<10}  {self._format_score(score):>6}"
             surf = self.font_small.render(line, True, (200, 205, 220))
             self.screen.blit(surf, (sidebar_x + 12, y))
             y += 22
