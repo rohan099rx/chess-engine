@@ -346,6 +346,10 @@ class PygameChessGUI:
             mg = MoveGenerator(b)
             eval_now = float(mg.evaluate_position())
 
+            # Defensive: only show moves that are legal in this position.
+            is_white_to_move = b.turn == "white"
+            legal_set = set(mg.generate_all_legal_moves(is_white_to_move))
+
             root_scores_latest: list[tuple[tuple, float]] | None = None
 
             def _on_depth_complete(depth, score_for_display, pv, root_scores_display=None):
@@ -372,6 +376,8 @@ class PygameChessGUI:
             if root_scores_latest:
                 # Keep top 8 moves
                 for (move, score) in root_scores_latest[:8]:
+                    if move not in legal_set:
+                        continue
                     start, end, promo = move
                     try:
                         san = move_to_san(b, mg, start, end, promo)
@@ -382,8 +388,7 @@ class PygameChessGUI:
                     lines.append((san, float(score)))
             else:
                 # Fallback: score a handful of legal moves quickly (still multi-move suggestions).
-                is_white = b.turn == "white"
-                moves = mg.generate_all_legal_moves(is_white)
+                moves = list(legal_set)
                 scored = []
                 for (start, end, promo) in moves[:20]:
                     state = b.make_move(start, end, promo)
@@ -394,7 +399,7 @@ class PygameChessGUI:
 
                     scored.append(((start, end, promo), s))
 
-                scored.sort(key=lambda ms: ms[1] if is_white else -ms[1], reverse=True)
+                scored.sort(key=lambda ms: ms[1] if is_white_to_move else -ms[1], reverse=True)
                 for (move, s) in scored[:8]:
                     start, end, promo = move
                     try:
@@ -491,6 +496,11 @@ class PygameChessGUI:
 
         start, end, promo = self._ai_best_move
         self._ai_best_move = None
+
+        # Defensive: validate move is legal in the current position.
+        is_white_to_move = self.board.turn == "white"
+        if (start, end, promo) not in set(self.mg.generate_all_legal_moves(is_white_to_move)):
+            return
         self._apply_move(start, end, promo)
         self.selected = None
 
