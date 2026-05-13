@@ -86,6 +86,7 @@ class PygameChessGUI:
         self.mg = MoveGenerator(self.board)
 
         self.selected: tuple[int, int] | None = None
+        self.legal_ends: list[tuple[int, int]] = []
         self.last_move: tuple[tuple[int, int], tuple[int, int]] | None = None
         self.undo_stack: list[_UndoRecord] = []
 
@@ -108,7 +109,7 @@ class PygameChessGUI:
         self._analysis_depth = 0
         self._analysis_best_pv_text = ""
         self._analysis_suggested_moves: list[tuple[tuple[int, int], tuple[int, int], str | None, float, str]] = []
-        self._analysis_multipv: list[tuple[float, str]] = []  # list[(score, pv_text)] white-perspective
+        self._analysis_multipv: list[tuple[float, str]] = []  # list[(score, line_text)] white-perspective
 
         self._anim_active = False
         self._anim_piece: str | None = None
@@ -350,6 +351,10 @@ class PygameChessGUI:
         self._position_generation += 1
         self._start_analysis()
 
+        # Clear selection/highlights after making a move.
+        self.selected = None
+        self.legal_ends = []
+
     def _undo_halfmove(self):
         if not self.undo_stack:
             return
@@ -372,6 +377,7 @@ class PygameChessGUI:
             self._undo_halfmove()
 
         self.selected = None
+        self.legal_ends = []
 
     # ------------------------------------------------------------------
     # Promotion handling
@@ -399,7 +405,8 @@ class PygameChessGUI:
         # Level 1 is intentionally weak/random.
         if self.difficulty <= 1:
             return 1
-        return self.difficulty
+        # Slightly stronger than the raw 1-5 scale.
+        return {2: 3, 3: 4, 4: 5, 5: 6}.get(self.difficulty, self.difficulty)
 
     # ------------------------------------------------------------------
     # Engine analysis (suggested moves + eval)
@@ -475,13 +482,13 @@ class PygameChessGUI:
                 best_score_latest = float(score_for_display)
                 depth_latest = int(depth)
 
-            depth = max(2, self._difficulty_to_depth())
+            depth = max(3, self._difficulty_to_depth() + 1)
 
             try:
                 mg.find_best_move(
                     depth=depth,
                     is_white_turn=(b.turn == "white"),
-                    max_time=0.6,
+                    max_time=1.0,
                     verbose=False,
                     on_depth_complete=_on_depth_complete,
                     use_book=True,
@@ -563,7 +570,8 @@ class PygameChessGUI:
                 self._analysis_depth = depth_latest
                 self._analysis_best_pv_text = best_pv_text
                 self._analysis_suggested_moves = suggested_moves
-                self._analysis_multipv = self._build_multipv_lines(snapshot, suggested_moves, depth_latest)
+                # Keep multipv display simple/fast/reliable: score + first move SAN.
+                self._analysis_multipv = [(sc, san) for (san, sc) in self._analysis_lines[:6]]
 
             with self._analysis_state_lock:
                 self._analysis_thinking = False
@@ -584,64 +592,16 @@ class PygameChessGUI:
                         )
                         t.start()
 
-    def _build_multipv_lines(
-        self,
-        snapshot: dict,
-        suggested_moves: list[tuple[tuple[int, int], tuple[int, int], str | None, float, str]],
-        depth_latest: int,
-    ) -> list[tuple[float, str]]:
-        # Create short PV strings for the top candidate moves.
-        if not suggested_moves:
-            return []
-
-        start_fullmove = self._current_fullmove_number()
-        start_white = snapshot["turn"] == "white"
-
-        out: list[tuple[float, str]] = []
-        top = suggested_moves[:5]
-        for (s, e, p, score, san0) in top:
-            # Start with the candidate move's SAN.
-            sans = [san0]
-            if depth_latest >= 2:
-                try:
-                    b_line = self._board_from_snapshot(snapshot)
-                    mg_line = MoveGenerator(b_line)
-                    cur_white = b_line.turn == "white"
-
-                    # Apply first move so continuations make sense.
-                    b_line.turn = "white" if cur_white else "black"
-                    st = b_line.make_move(s, e, p)
-                    cur_white = not cur_white
-
-                    # Add a few continuation plies with a very small time budget.
-                    for _ in range(3):
-                        bm, _sc = mg_line.find_best_move(
-                            depth=min(3, max(2, depth_latest - 1)),
-                            is_white_turn=cur_white,
-                            max_time=0.06,
-                            verbose=False,
-                            use_book=False,
-                        )
-                        if bm is None:
-                            break
-                        s2, e2, p2 = bm
-                        b_line.turn = "white" if cur_white else "black"
-                        try:
-                            san = move_to_san(b_line, mg_line, s2, e2, p2)
-                        except Exception:
-                            san = f"{b_line.square_to_algebraic(s2[0], s2[1])}{b_line.square_to_algebraic(e2[0], e2[1])}"
-                            if p2:
-                                san += p2.lower()
-                        sans.append(san)
-                        b_line.make_move(s2, e2, p2)
-                        cur_white = not cur_white
-                except Exception:
-                    pass
-
-            pv_text = self._format_pv_with_numbers(sans, start_fullmove, start_white)
-            out.append((float(score), pv_text))
-
-        return out
+    def _is_brilliant_best(self) -> bool:
+        # Heuristic: best move is "brilliant" if it stands out clearly from #2.
+        if len(self._analysis_suggested_moves) < 2:
+            return False
+        (s1, e1, p1, sc1, _san1) = self._analysis_suggested_moves[0]
+        (_s2, _e2, _p2, sc2, _san2) = self._analysis_suggested_moves[1]
+        # Compare from side-to-move perspective.
+        stm = 1.0 if self.board.turn == "white" else -1.0
+        diff = (sc1 * stm) - (sc2 * stm)
+        return diff >= 0.60
 
     def _start_ai_if_needed(self):
         if self._ai_thinking:
@@ -722,6 +682,8 @@ class PygameChessGUI:
         dark = (181, 136, 99)
         sel = (246, 246, 105)
         last = (170, 205, 100)
+        legal = (90, 140, 220)
+        best_legal = (245, 200, 60)
         check = (220, 80, 90)
 
         self.screen.fill((20, 20, 24))
@@ -775,6 +737,20 @@ class PygameChessGUI:
             rect = pygame.Rect(x, y, self.square_size, self.square_size)
             pygame.draw.rect(self.screen, sel, rect, 4)
 
+        # Legal move dots (shown only for current selection)
+        best_move = self._analysis_suggested_moves[0] if self._analysis_suggested_moves else None
+        best_from_selected = None
+        if best_move is not None and self.selected is not None:
+            s, e, p, sc, san = best_move
+            if s == self.selected:
+                best_from_selected = e
+
+        for (r, c) in self.legal_ends:
+            x, y = self._square_to_screen(r, c)
+            center = (x + self.square_size // 2, y + self.square_size // 2)
+            color = best_legal if best_from_selected == (r, c) else legal
+            pygame.draw.circle(self.screen, color, center, self.square_size // 8)
+
         # Check highlight
         stm_is_white = self._side_to_move_is_white()
         if self.mg.is_in_check(stm_is_white):
@@ -783,13 +759,14 @@ class PygameChessGUI:
             rect = pygame.Rect(x, y, self.square_size, self.square_size)
             pygame.draw.rect(self.screen, check, rect, 4)
 
-        # Suggested move arrows (top 3)
+        # Suggested move arrow (only best; gold if "brilliant")
         if self._analysis_suggested_moves:
-            arrow_color = (90, 140, 220)
-            for idx, (s, e, _p, _sc, _san) in enumerate(self._analysis_suggested_moves[:3]):
-                alpha = 170 - idx * 45
-                width = 11 - idx * 2
-                self._draw_arrow(s, e, rgba=(arrow_color[0], arrow_color[1], arrow_color[2], max(60, alpha)), width=max(6, width))
+            s, e, _p, _sc, _san = self._analysis_suggested_moves[0]
+            if self._is_brilliant_best():
+                col = (245, 200, 60, 200)
+            else:
+                col = (90, 140, 220, 190)
+            self._draw_arrow(s, e, rgba=col, width=10)
 
         # Pieces (with optional animation overlay)
         anim_piece = None
@@ -862,9 +839,27 @@ class PygameChessGUI:
 
         y = 66
         max_w = self.sidebar_w - 24
+        # Best PV (wrapped)
+        if self._analysis_best_pv_text:
+            words = self._analysis_best_pv_text.split(" ")
+            line_words = []
+            for w in words:
+                cand = (" ".join(line_words + [w])).strip()
+                if self.font_small.size(cand)[0] > max_w and line_words:
+                    surf = self.font_small.render(" ".join(line_words), True, (210, 215, 230))
+                    self.screen.blit(surf, (sidebar_x + 12, y))
+                    y += 18
+                    line_words = [w]
+                else:
+                    line_words.append(w)
+            if line_words:
+                surf = self.font_small.render(" ".join(line_words), True, (210, 215, 230))
+                self.screen.blit(surf, (sidebar_x + 12, y))
+                y += 24
+
         lines = self._analysis_multipv if self._analysis_multipv else [(sc, san) for (san, sc) in self._analysis_lines[:5]]
-        for idx, (score, pv_text) in enumerate(lines[:5], 1):
-            line = f"{self._format_cp(score):>6}  {pv_text}"
+        for idx, (score, move_text) in enumerate(lines[:5], 1):
+            line = f"{self._format_cp(score):>6}  {move_text}"
             line = ellipsize(line, max_w)
             color = (235, 235, 240) if idx == 1 else (190, 195, 210)
             surf = self.font_small.render(line, True, color)
@@ -893,6 +888,22 @@ class PygameChessGUI:
     # Input
     # ------------------------------------------------------------------
 
+    def _refresh_selection(self):
+        if self.selected is None:
+            self.legal_ends = []
+            return
+        r, c = self.selected
+        piece = self.board.get_piece(r, c)
+        if piece == ".":
+            self.selected = None
+            self.legal_ends = []
+            return
+        if self._side_to_move_is_white() != piece.isupper():
+            self.selected = None
+            self.legal_ends = []
+            return
+        self.legal_ends = self.mg.get_legal_moves(r, c)
+
     def _handle_click(self, pos):
         if self.pending_promotion is not None:
             return
@@ -913,26 +924,27 @@ class PygameChessGUI:
             if piece.isupper() != self._side_to_move_is_white():
                 return
             self.selected = (r, c)
+            self._refresh_selection()
             return
 
         # Attempt move (we do NOT precompute highlights; only validate here).
         start = self.selected
-        legal_ends = self.mg.get_legal_moves(start[0], start[1])
-        if (r, c) in legal_ends:
+        if (r, c) in self.legal_ends:
             end = (r, c)
             if self._needs_promotion(start, end):
                 self.pending_promotion = (start, end)
                 return
             self._apply_move(start, end, None)
-            self.selected = None
             return
 
         # Otherwise update selection.
         piece = self.board.get_piece(r, c)
         if piece != "." and piece.isupper() == self._side_to_move_is_white():
             self.selected = (r, c)
+            self._refresh_selection()
         else:
             self.selected = None
+            self.legal_ends = []
 
     def _handle_key(self, key):
         if key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5):
