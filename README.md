@@ -10,11 +10,19 @@ Install dependencies:
 py -m pip install -r requirements.txt
 ```
 
-Run the GUI:
+Run the GUI (Pygame, playable vs AI):
 
 ```bash
 py main.py
 ```
+
+Controls (Pygame):
+
+- Click: select/move (legal moves highlighted)
+- `U`: undo last full move (you + AI)
+- `1`-`5`: difficulty (search depth)
+- `F`: flip board
+- `R`: reset
 
 Run tests:
 
@@ -83,7 +91,16 @@ chess-engine/
 - Background engine search so the GUI stays responsive.
 - Best-move arrow and evaluation bar.
 - Polyglot opening book support via `Titans/Titans.bin`.
-- Search depth is currently `5` in the GUI, with time-controlled search available through the engine/UCI API.
+- Playable Pygame UI (human vs AI) with legal-move highlights and undo.
+- Search depth is adjustable in the Pygame UI (difficulty levels 1–5).
+
+## Tkinter Analysis GUI (optional)
+
+The original Tkinter analysis interface is still available:
+
+```bash
+py -c "from ui.gui import ChessGUI; ChessGUI().run()"
+```
 
 ## Opening Book
 
