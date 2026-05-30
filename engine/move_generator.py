@@ -113,7 +113,9 @@ class MoveGenerator:
         self.board = board
         self.board.refresh_zobrist_hash()
         self.transposition_table = {}
-        self.killers = [[None, None] for _ in range(20)]
+        # Killer moves keyed by remaining depth. Size needs to cover our maximum
+        # practical search depths (including check extensions).
+        self.killers = [[None, None] for _ in range(128)]
         self.history = {}
         self.nodes_searched = 0
         self.node_count = 0
@@ -130,6 +132,44 @@ class MoveGenerator:
         self.tt_max_entries = max(1000, mb * 1024 * 1024 // 300)
         if len(self.transposition_table) > self.tt_max_entries:
             self.transposition_table.clear()
+
+    def import_transposition_table(self, other):
+        """Merge entries, killers and history from another MoveGenerator.
+
+        Prefer entries with greater depth. Stop if capacity reached.
+        """
+        if other is None:
+            return
+
+        # Merge TT entries (prefer deeper entries)
+        for key, entry in other.transposition_table.items():
+            if len(self.transposition_table) >= self.tt_max_entries:
+                break
+            if key not in self.transposition_table:
+                self.transposition_table[key] = entry
+            else:
+                # entry = (depth, score, flag, move)
+                cur = self.transposition_table[key]
+                try:
+                    if entry[0] > cur[0]:
+                        self.transposition_table[key] = entry
+                except Exception:
+                    self.transposition_table[key] = entry
+
+        # Merge killer moves (keep unique)
+        maxk = min(len(self.killers), len(other.killers))
+        for d in range(maxk):
+            for k in other.killers[d]:
+                if k is None:
+                    continue
+                if k not in self.killers[d]:
+                    # shift older into second slot
+                    self.killers[d][1] = self.killers[d][0]
+                    self.killers[d][0] = k
+
+        # Merge history heuristics (take max)
+        for move, score in other.history.items():
+            self.history[move] = max(self.history.get(move, 0), score)
 
     @classmethod
     def _build_eval_table(cls):
@@ -969,34 +1009,54 @@ class MoveGenerator:
             for current_depth in range(1, depth + 1):
                 depth_t0 = time.perf_counter()
                 depth_nodes_before = self.nodes_searched
-                moves.sort(key=lambda m: 0 if m == best_move else 1)
 
-                iter_best_move = None
-                iter_best_score = float("-inf")
-                alpha = float("-inf")
-                beta = float("inf")
+                # Root move ordering: keep PV move first, then apply standard ordering.
+                # This materially improves pruning and makes aspiration windows viable.
+                moves = self.order_moves(moves, is_white_turn, depth=current_depth, tt_move=best_move)
 
-                root_scores_raw = []
+                def _search_root(alpha, beta):
+                    iter_best_move_local = None
+                    iter_best_score_local = float("-inf")
+                    root_scores_raw_local = []
 
-                for move_index, (start, end, promo) in enumerate(moves):
-                    self.board.turn = "white" if is_white_turn else "black"
-                    move_state = self.board.make_move(start, end, promo)
-                    if move_index == 0:
-                        score = -self.negamax(current_depth - 1, not is_white_turn, -beta, -alpha)
-                    else:
-                        score = -self.negamax(current_depth - 1, not is_white_turn, -alpha - 1, -alpha)
-                        if score > alpha and score < beta:
+                    for move_index, (start, end, promo) in enumerate(moves):
+                        self.board.turn = "white" if is_white_turn else "black"
+                        move_state = self.board.make_move(start, end, promo)
+                        if move_index == 0:
                             score = -self.negamax(current_depth - 1, not is_white_turn, -beta, -alpha)
-                    self.board.undo_move(start, end, move_state)
+                        else:
+                            score = -self.negamax(current_depth - 1, not is_white_turn, -alpha - 1, -alpha)
+                            if score > alpha and score < beta:
+                                score = -self.negamax(current_depth - 1, not is_white_turn, -beta, -alpha)
+                        self.board.undo_move(start, end, move_state)
 
-                    # Root scores are kept from the side-to-move's perspective.
-                    root_scores_raw.append(((start, end, promo), score))
+                        # Root scores are kept from the side-to-move's perspective.
+                        root_scores_raw_local.append(((start, end, promo), score))
 
-                    if score > iter_best_score:
-                        iter_best_score = score
-                        iter_best_move = (start, end, promo)
-                    if iter_best_score > alpha:
-                        alpha = iter_best_score
+                        if score > iter_best_score_local:
+                            iter_best_score_local = score
+                            iter_best_move_local = (start, end, promo)
+                        if iter_best_score_local > alpha:
+                            alpha = iter_best_score_local
+
+                    return iter_best_move_local, iter_best_score_local, root_scores_raw_local
+
+                # Aspiration windows around the previous iteration score. This often
+                # reduces node count substantially in stable positions.
+                asp_alpha = float("-inf")
+                asp_beta = float("inf")
+                used_asp = False
+                if current_depth >= 2 and best_score != float("-inf"):
+                    window = 0.60  # pawns
+                    asp_alpha = best_score - window
+                    asp_beta = best_score + window
+                    used_asp = True
+
+                iter_best_move, iter_best_score, root_scores_raw = _search_root(asp_alpha, asp_beta)
+
+                # If aspiration fails high/low, re-search once with full window.
+                if used_asp and (iter_best_score <= asp_alpha or iter_best_score >= asp_beta):
+                    iter_best_move, iter_best_score, root_scores_raw = _search_root(float("-inf"), float("inf"))
 
                 if iter_best_move is not None:
                     best_move = iter_best_move

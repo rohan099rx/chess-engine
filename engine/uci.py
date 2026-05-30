@@ -1,5 +1,6 @@
 import sys
 import time
+import threading
 
 from engine.board import Board
 from engine.move_generator import MoveGenerator
@@ -8,10 +9,12 @@ from engine.move_generator import MoveGenerator
 STARTPOS_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
 _OPTIONS = {
-    "Hash":          ("spin", 64,  1,    2048),  # (type, default, min, max)
-    "Move Overhead": ("spin", 50,  0,    5000),
-    "Threads":       ("spin",  1,  1,       1),
-    "MultiPV":        ("spin",  1,  1,     256),
+    "Hash":          ("spin", 128,  1,    4096),  # (type, default, min, max) in MB
+    "Move Overhead": ("spin", 50,   0,    5000),
+    "Threads":       ("spin",  1,   1,       8),
+    "MultiPV":       ("spin",  1,   1,     256),
+    "Skill Level":   ("spin", 20,   0,      20),
+    "Ponder":        ("check", 0,   0,       1),
 }
 
 
@@ -178,6 +181,59 @@ def main():
     board = Board()
     mg = MoveGenerator(board)
     multipv = _OPTIONS["MultiPV"][1]
+    threads = _OPTIONS["Threads"][1]
+    skill_level = _OPTIONS["Skill Level"][1]
+    ponder_enabled = bool(_OPTIONS["Ponder"][1])
+    # Surface some engine prefs onto the move generator for tooling/UI.
+    mg.threads = threads
+    mg.skill_level = skill_level
+    mg.ponder = ponder_enabled
+
+    # Pondering/background search state
+    ponder_state = {
+        "thread": None,
+        "lock": threading.Lock(),
+        "result": None,
+        "bg_mg": None,
+        "committed": False,
+        "bestmove_sent": False,
+        "pending_movetime": None,
+    }
+
+    def _bg_search(mg_obj, board_snapshot, depth, movetime, multipv, use_book, is_white):
+        # Run find_best_move in background and stash the result.
+        try:
+            best_move, score = mg_obj.find_best_move(
+                depth, is_white, max_time=movetime, verbose=False,
+                on_depth_complete=make_info_callback(mg_obj, time.perf_counter(), multipv=multipv),
+                use_book=use_book,
+            )
+        except Exception:
+            best_move, score = (None, 0)
+        with ponder_state["lock"]:
+            ponder_state["result"] = (best_move, score)
+            ponder_state["bg_mg"] = mg_obj
+            ponder_state["thread"] = None
+
+        if best_move is None:
+            return
+
+        # If ponderhit already happened, emit the move immediately. Otherwise
+        # wait until the commit signal arrives and then emit without restarting.
+        while True:
+            with ponder_state["lock"]:
+                committed = ponder_state["committed"]
+                already_sent = ponder_state["bestmove_sent"]
+                current_result = ponder_state["result"]
+                current_bg_mg = ponder_state["bg_mg"]
+                if committed and (not already_sent) and current_result is not None:
+                    if current_bg_mg is not None:
+                        mg.import_transposition_table(current_bg_mg)
+                    print(f"bestmove {move_to_uci(best_move)}", flush=True)
+                    ponder_state["bestmove_sent"] = True
+                    ponder_state["result"] = None
+                    break
+            time.sleep(0.01)
 
     for raw_line in sys.stdin:
         line = raw_line.strip()
@@ -224,7 +280,36 @@ def main():
                                                      *_OPTIONS["Move Overhead"][2:])
                     except ValueError:
                         pass
-                # Threads: always 1, silently accepted
+                elif opt_name == "Threads" and val_str is not None:
+                    try:
+                        v = max(_OPTIONS["Threads"][2], min(_OPTIONS["Threads"][3], int(val_str)))
+                        _OPTIONS["Threads"] = (_OPTIONS["Threads"][0], v, *_OPTIONS["Threads"][2:])
+                        threads = v
+                        mg.threads = v
+                    except ValueError:
+                        pass
+                elif opt_name == "Skill Level" and val_str is not None:
+                    try:
+                        v = max(_OPTIONS["Skill Level"][2], min(_OPTIONS["Skill Level"][3], int(val_str)))
+                        _OPTIONS["Skill Level"] = (_OPTIONS["Skill Level"][0], v, *_OPTIONS["Skill Level"][2:])
+                        skill_level = v
+                        mg.skill_level = v
+                    except ValueError:
+                        pass
+                elif opt_name == "Ponder":
+                    # value may be omitted for check types; treat presence as True/False
+                    if val_str is None:
+                        ponder_enabled = True
+                        _OPTIONS["Ponder"] = (_OPTIONS["Ponder"][0], 1, *_OPTIONS["Ponder"][2:])
+                        mg.ponder = True
+                    else:
+                        try:
+                            v = 1 if val_str.lower() in ("1", "true", "on") else 0
+                            _OPTIONS["Ponder"] = (_OPTIONS["Ponder"][0], v, *_OPTIONS["Ponder"][2:])
+                            ponder_enabled = bool(v)
+                            mg.ponder = ponder_enabled
+                        except Exception:
+                            pass
 
         elif command == "isready":
             print("readyok")
@@ -242,6 +327,42 @@ def main():
             t0 = time.perf_counter()
             callback = make_info_callback(mg, t0, multipv=multipv)
             use_book = (multipv <= 1)
+
+            if "ponder" in args:
+                # Start background pondering search and return immediately.
+                # Clone current board into a background MoveGenerator so the
+                # ponder search can build a separate transposition table.
+                bg_board = Board()
+                try:
+                    bg_board.set_fen(board.to_fen(board.halfmove_clock))
+                except Exception:
+                    # Fallback to copying via FEN start position if something odd.
+                    bg_board.set_fen(board.to_fen(board.halfmove_clock))
+                bg_mg = MoveGenerator(bg_board)
+                # Inherit tt size and options from main mg
+                bg_mg.tt_max_entries = mg.tt_max_entries
+                bg_mg.killers = [k[:] for k in mg.killers]
+                bg_mg.history = mg.history.copy()
+                bg_mg.in_opening = mg.in_opening
+                with ponder_state["lock"]:
+                    # Clear any previous result
+                    ponder_state["result"] = None
+                    ponder_state["bg_mg"] = bg_mg
+                    ponder_state["committed"] = False
+                    ponder_state["bestmove_sent"] = False
+                    ponder_state["pending_movetime"] = movetime
+                    bg_mg.stop_search = False
+                    th = threading.Thread(
+                        target=_bg_search,
+                        args=(bg_mg, None, depth, None, multipv, use_book, is_white),
+                        daemon=True,
+                    )
+                    ponder_state["thread"] = th
+                    th.start()
+                # Do not emit bestmove now; wait for ponderhit or stop.
+                continue
+
+            # Normal (blocking) search
             best_move, score = mg.find_best_move(
                 depth, is_white, max_time=movetime, verbose=False,
                 on_depth_complete=callback,
@@ -256,10 +377,34 @@ def main():
             print(f"bestmove {move_to_uci(best_move)}", flush=True)
 
         elif command == "stop":
+            # Stop any current foreground search
             mg.stop_search = True
+            # If we have a background ponder search, stop it and let the
+            # background thread emit bestmove once it has a result.
+            with ponder_state["lock"]:
+                th = ponder_state.get("thread")
+                pmg = ponder_state.get("bg_mg")
+                ponder_state["committed"] = True
+            if th is not None and th.is_alive():
+                if pmg is not None:
+                    pmg.stop_search = True
+                th.join(timeout=1.0)
+            with ponder_state["lock"]:
+                ponder_state["thread"] = None
 
         elif command == "quit":
             break
+
+        elif command == "ponderhit":
+            # Opponent played the pondered move: let the background search continue
+            # and give it a real time budget from this point on.
+            with ponder_state["lock"]:
+                th = ponder_state.get("thread")
+                pmg = ponder_state.get("bg_mg")
+                pending_movetime = ponder_state.get("pending_movetime")
+                ponder_state["committed"] = True
+            if pmg is not None and pending_movetime is not None:
+                pmg.search_deadline = time.perf_counter() + pending_movetime
 
         sys.stdout.flush()
 

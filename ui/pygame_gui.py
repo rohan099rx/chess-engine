@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from engine.board import Board
 from engine.move_generator import MoveGenerator
+from engine.opening_book import get_book_entries
 from engine.notation import move_to_san
 
 
@@ -39,6 +40,16 @@ class _UndoRecord:
     move_state: dict
     prev_turn: str
     prev_position_counts: dict
+    prev_white_time_left: float | None
+    prev_black_time_left: float | None
+    prev_last_clock_tick: float
+    prev_active_clock_side: str
+    prev_review_len: int
+    prev_san_len: int
+    prev_review_selected_index: int | None
+    prev_review_mode: bool
+    prev_game_over_reason: str
+    prev_game_over_status: str
 
 
 class PygameChessGUI:
@@ -58,6 +69,8 @@ class PygameChessGUI:
         square_size: int = 80,
         human_plays_white: bool = True,
         difficulty: int = 3,
+        time_minutes: int = 5,
+        increment_seconds: int = 0,
     ):
         if pygame is None:  # pragma: no cover
             raise RuntimeError(
@@ -69,7 +82,7 @@ class PygameChessGUI:
         self.board_px = 8 * square_size
 
         self.eval_w = 26
-        self.sidebar_w = 320
+        self.sidebar_w = 380
         self.panel_h = 90
 
         self.board_origin_x = self.eval_w
@@ -81,6 +94,8 @@ class PygameChessGUI:
         self.human_plays_white = human_plays_white
         self.difficulty = max(1, min(5, int(difficulty)))
         self.flipped = False
+        self.time_minutes = max(0, int(time_minutes))
+        self.increment_seconds = max(0, int(increment_seconds))
 
         self.board = Board()
         self.mg = MoveGenerator(self.board)
@@ -91,6 +106,18 @@ class PygameChessGUI:
         self.undo_stack: list[_UndoRecord] = []
 
         self.pending_promotion: tuple[tuple[int, int], tuple[int, int]] | None = None
+        self.move_history_review: list[dict] = []
+        self.move_san_history: list[str] = []
+        self.review_selected_index: int | None = None
+        self._review_row_hitboxes: list[tuple[int, object]] = []
+        self.review_mode = False
+        self.game_over_reason = ""
+        self.game_over_status = "ongoing"
+
+        self.white_time_left = float(self.time_minutes * 60) if self.time_minutes > 0 else None
+        self.black_time_left = float(self.time_minutes * 60) if self.time_minutes > 0 else None
+        self._last_clock_tick = time.perf_counter()
+        self._active_clock_side = self.board.turn
 
         self._position_generation = 0
 
@@ -110,6 +137,8 @@ class PygameChessGUI:
         self._analysis_best_pv_text = ""
         self._analysis_suggested_moves: list[tuple[tuple[int, int], tuple[int, int], str | None, float, str]] = []
         self._analysis_multipv: list[tuple[float, str]] = []  # list[(score, line_text)] white-perspective
+        self._opening_theory_label = "Starting position"
+        self._opening_theory_detail = "Book coverage unavailable"
 
         self._anim_active = False
         self._anim_piece: str | None = None
@@ -124,11 +153,13 @@ class PygameChessGUI:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("Menlo", 18)
         self.font_small = pygame.font.SysFont("Menlo", 14)
+        self.font_tiny = pygame.font.SysFont("Menlo", 12)
 
         self._load_images()
 
         # Initial analysis for the starting position
         self._start_analysis()
+        self._refresh_opening_theory()
 
     # ------------------------------------------------------------------
     # PV / formatting helpers
@@ -202,6 +233,64 @@ class PygameChessGUI:
         if abs(score) >= 900:
             return "#"
         return f"{score:+.2f}"
+
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    def _score_label(self, score: float) -> str:
+        if abs(score) >= 900:
+            return "#"
+        return f"{score:+.2f}"
+
+    def _score_strength(self, score: float) -> float:
+        # Convert a score to a 0..1 confidence-style meter.
+        if abs(score) >= 900:
+            return 1.0
+        return self._clamp01(abs(self._score_to_norm(score)))
+
+    def _draw_card(self, rect, fill, border=(70, 78, 92), radius=16, border_width=1):
+        pygame.draw.rect(self.screen, fill, rect, border_radius=radius)
+        pygame.draw.rect(self.screen, border, rect, border_width, border_radius=radius)
+
+    def _draw_section_title(self, x, y, text, accent=(112, 169, 255)):
+        dot = pygame.Rect(x, y + 6, 8, 8)
+        pygame.draw.ellipse(self.screen, accent, dot)
+        title = self.font.render(text, True, (236, 239, 245))
+        self.screen.blit(title, (x + 14, y))
+
+    def _draw_eval_meter(self, x, y, w, h, score):
+        ratio = self._score_to_ratio(score)
+        track = pygame.Rect(x, y, w, h)
+        white_w = int(round(w * ratio))
+        pygame.draw.rect(self.screen, (27, 30, 38), track, border_radius=8)
+        pygame.draw.rect(self.screen, (236, 236, 240), pygame.Rect(x, y, white_w, h), border_radius=8)
+        if white_w < w:
+            pygame.draw.rect(self.screen, (11, 14, 18), pygame.Rect(x + white_w, y, w - white_w, h), border_radius=8)
+        pygame.draw.rect(self.screen, (80, 86, 98), track, 1, border_radius=8)
+
+    def _draw_move_row(self, x, y, w, move_text, score, rank, selected=False):
+        row_h = 34
+        fill = (31, 35, 43) if not selected else (37, 45, 58)
+        border = (75, 90, 120) if selected else (58, 64, 76)
+        rect = pygame.Rect(x, y, w, row_h)
+        self._draw_card(rect, fill, border=border, radius=10)
+
+        rank_surf = self.font_small.render(f"{rank}.", True, (171, 177, 190))
+        self.screen.blit(rank_surf, (x + 10, y + 8))
+
+        move_surf = self.font_small.render(move_text, True, (244, 246, 250))
+        self.screen.blit(move_surf, (x + 32, y + 8))
+
+        score_txt = self._score_label(score)
+        score_surf = self.font_small.render(score_txt, True, (255, 217, 119) if score >= 0 else (255, 156, 156))
+        self.screen.blit(score_surf, (x + w - score_surf.get_width() - 10, y + 8))
+
+        bar_w = int((w - 20) * self._score_strength(score))
+        bar_color = (88, 196, 130) if score >= 0 else (255, 130, 130)
+        pygame.draw.rect(self.screen, (45, 50, 61), pygame.Rect(x + 10, y + 23, w - 20, 4), border_radius=2)
+        pygame.draw.rect(self.screen, bar_color, pygame.Rect(x + 10, y + 23, bar_w, 4), border_radius=2)
+        return row_h
 
     def _draw_arrow(self, start_sq: tuple[int, int], end_sq: tuple[int, int], *, rgba: tuple[int, int, int, int], width: int = 10):
         # Draw an arrow from start to end.
@@ -310,7 +399,184 @@ class PygameChessGUI:
         return self.board.turn == "white"
 
     def _human_to_move(self) -> bool:
-        return self._side_to_move_is_white() == self.human_plays_white
+        return self.game_over_status == "ongoing" and self._side_to_move_is_white() == self.human_plays_white
+
+    def _remaining_time_for_side(self, side: str) -> float | None:
+        return self.white_time_left if side == "white" else self.black_time_left
+
+    @staticmethod
+    def _format_clock(seconds_left: float | None) -> str:
+        if seconds_left is None:
+            return "--:--"
+        seconds_left = max(0.0, float(seconds_left))
+        whole = int(seconds_left)
+        minutes = whole // 60
+        seconds = whole % 60
+        return f"{minutes}:{seconds:02d}"
+
+    def _tick_clocks(self):
+        if self.white_time_left is None or self.black_time_left is None:
+            return
+        now = time.perf_counter()
+        elapsed = max(0.0, now - self._last_clock_tick)
+        self._last_clock_tick = now
+
+        if self.game_over_status != "ongoing":
+            return
+
+        if self._active_clock_side == "white":
+            self.white_time_left = max(0.0, self.white_time_left - elapsed)
+            if self.white_time_left <= 0.0:
+                self._finalize_game("time_forfeit", "White ran out of time")
+        else:
+            self.black_time_left = max(0.0, self.black_time_left - elapsed)
+            if self.black_time_left <= 0.0:
+                self._finalize_game("time_forfeit", "Black ran out of time")
+
+    def _apply_clock_increment(self, side: str):
+        if side == "white" and self.white_time_left is not None:
+            self.white_time_left += float(self.increment_seconds)
+        elif side == "black" and self.black_time_left is not None:
+            self.black_time_left += float(self.increment_seconds)
+
+    def _opening_theory_from_history(self) -> tuple[str, str]:
+        moves = self.move_san_history[:6]
+        if not moves:
+            return "Starting position", "Open with 1.e4, 1.d4, 1.c4 or 1.Nf3 to enter common theory."
+
+        joined = " ".join(moves)
+        prefixes = [
+            (("e4", "e5", "Nf3", "Nc6", "Bb5"), "Ruy Lopez"),
+            (("e4", "e5", "Nf3", "Nc6", "Bc4"), "Italian Game"),
+            (("e4", "c5"), "Sicilian Defence"),
+            (("e4", "e6"), "French Defence"),
+            (("e4", "c6"), "Caro-Kann Defence"),
+            (("d4", "d5", "c4"), "Queen's Gambit"),
+            (("d4", "Nf6", "c4", "g6"), "King's Indian Defence"),
+            (("c4",), "English Opening"),
+            (("Nf3",), "Reti Opening"),
+        ]
+
+        for seq, name in prefixes:
+            if all(token in joined for token in seq):
+                return f"Opening theory · {name}", f"The current line matches a common {name} setup."
+
+        book_entries = get_book_entries(self.board, limit=3)
+        if book_entries:
+            best_move, weight = book_entries[0]
+            start, end, promo = best_move
+            move_text = f"{self.board.square_to_algebraic(start[0], start[1])}{self.board.square_to_algebraic(end[0], end[1])}"
+            if promo:
+                move_text += promo.lower()
+            return "Opening theory · In book", f"Book move suggestion: {move_text} (weight {weight})."
+
+        return "Opening theory · Out of book", "This position is no longer in the opening book; engine evaluation is driving the line."
+
+    def _refresh_opening_theory(self):
+        self._opening_theory_label, self._opening_theory_detail = self._opening_theory_from_history()
+
+    def _classify_review_loss(self, loss: float) -> str:
+        if loss <= 0.05:
+            return "Best"
+        if loss <= 0.15:
+            return "Excellent"
+        if loss <= 0.30:
+            return "Good"
+        if loss <= 0.60:
+            return "Inaccuracy"
+        if loss <= 1.00:
+            return "Mistake"
+        if loss <= 1.50:
+            return "Miss"
+        return "Blunder"
+
+    def _review_accuracy(self, side: str) -> float:
+        entries = [entry for entry in self.move_history_review if entry["side"] == side]
+        if not entries:
+            return 0.0
+        avg_loss = sum(entry["loss_cp"] for entry in entries) / float(len(entries))
+        return max(0.0, min(100.0, 100.0 - avg_loss * 0.42))
+
+    def _review_counts(self, side: str) -> dict[str, int]:
+        counts = {key: 0 for key in ("Brilliant", "Great", "Best", "Excellent", "Good", "Inaccuracy", "Mistake", "Miss", "Blunder")}
+        for entry in self.move_history_review:
+            if entry["side"] != side:
+                continue
+            counts[entry["classification"]] = counts.get(entry["classification"], 0) + 1
+        return counts
+
+    def _review_rows(self) -> list[dict]:
+        rows = []
+        for idx, entry in enumerate(self.move_history_review):
+            rows.append({"index": idx, **entry})
+        return rows
+
+    def _review_row_rect(self, sidebar_x: int, y: int, width: int):
+        return pygame.Rect(sidebar_x, y, width, 28)
+
+    def _select_review_entry(self, index: int | None):
+        if index is None:
+            self.review_selected_index = None
+            return
+        if 0 <= index < len(self.move_history_review):
+            self.review_selected_index = index
+
+    def _selected_review_entry(self):
+        if self.review_selected_index is None:
+            return None
+        if not (0 <= self.review_selected_index < len(self.move_history_review)):
+            return None
+        return self.move_history_review[self.review_selected_index]
+
+    def _finalize_game(self, reason: str, message: str):
+        self.game_over_status = reason
+        self.game_over_reason = message
+        self.review_mode = True
+
+    def _make_review_entry(self, start, end, promo, move_san: str, mover_side: str, snapshot: dict):
+        if self._analysis_suggested_moves:
+            best_entry = self._analysis_suggested_moves[0]
+            best_start, best_end, best_promo, _, best_san = best_entry
+            best_score_white = float(best_entry[3])
+        else:
+            best_start, best_end, best_promo = start, end, promo
+            best_score_white = float(self._analysis_eval)
+
+        mover_sign = 1.0 if mover_side == "white" else -1.0
+        best_stm = best_score_white * mover_sign
+
+        b_after = self._board_from_snapshot(snapshot)
+        mg_after = MoveGenerator(b_after)
+        after_white = float(mg_after.evaluate_position())
+        played_stm = after_white * mover_sign
+        loss = max(0.0, best_stm - played_stm)
+        loss_cp = int(round(loss * 100))
+
+        if (start, end, promo) == (best_start, best_end, best_promo):
+            category = "Best"
+        else:
+            category = self._classify_review_loss(loss)
+
+        return {
+            "side": mover_side,
+            "start": start,
+            "end": end,
+            "promo": promo,
+            "san": move_san,
+            "best_start": best_start,
+            "best_end": best_end,
+            "best_promo": best_promo,
+            "best_san": best_san if self._analysis_suggested_moves else move_san,
+            "best_score_white": best_score_white,
+            "played_score_white": after_white,
+            "loss": loss,
+            "loss_cp": loss_cp,
+            "classification": category,
+        }
+
+    def _append_review_entry(self, entry: dict):
+        self.move_history_review.append(entry)
+        self._refresh_opening_theory()
 
     # ------------------------------------------------------------------
     # Moves / undo
@@ -324,6 +590,16 @@ class PygameChessGUI:
                 move_state=move_state,
                 prev_turn=prev_turn,
                 prev_position_counts=prev_position_counts,
+                prev_white_time_left=self.white_time_left,
+                prev_black_time_left=self.black_time_left,
+                prev_last_clock_tick=self._last_clock_tick,
+                prev_active_clock_side=self._active_clock_side,
+                prev_review_len=len(self.move_history_review),
+                prev_san_len=len(self.move_san_history),
+                prev_review_selected_index=self.review_selected_index,
+                prev_review_mode=self.review_mode,
+                prev_game_over_reason=self.game_over_reason,
+                prev_game_over_status=self.game_over_status,
             )
         )
 
@@ -331,14 +607,29 @@ class PygameChessGUI:
         moving_piece = self.board.get_piece(start[0], start[1])
         prev_turn = self.board.turn
         prev_counts = self.board.position_counts.copy()
+        mover_side = prev_turn
+        try:
+            move_san = move_to_san(self.board, self.mg, start, end, promo)
+        except Exception:
+            move_san = f"{self.board.square_to_algebraic(start[0], start[1])}{self.board.square_to_algebraic(end[0], end[1])}"
+            if promo:
+                move_san += promo.lower()
         move_state = self.board.make_move(start, end, promo)
 
         # Update turn + repetition counts for gameplay (engine search doesn't use this).
         self.board.turn = "black" if self.board.turn == "white" else "white"
         self.board.record_current_position()
 
+        self._apply_clock_increment(mover_side)
+        self._active_clock_side = self.board.turn
+        self._last_clock_tick = time.perf_counter()
+
         self._push_undo(start, end, move_state, prev_turn, prev_counts)
         self.last_move = (start, end)
+
+        self.move_san_history.append(move_san)
+        review_entry = self._make_review_entry(start, end, promo, move_san, mover_side, self._capture_position())
+        self._append_review_entry(review_entry)
 
         # Start animation (visual only)
         self._anim_active = True
@@ -350,6 +641,10 @@ class PygameChessGUI:
         # Bump generation and refresh analysis
         self._position_generation += 1
         self._start_analysis()
+
+        status = self.mg.get_game_status()
+        if status["is_over"]:
+            self._finalize_game(status["result"], status["message"])
 
         # Clear selection/highlights after making a move.
         self.selected = None
@@ -363,6 +658,17 @@ class PygameChessGUI:
         self.board.undo_move(rec.start, rec.end, rec.move_state)
         self.board.position_counts = rec.prev_position_counts
         self.last_move = None
+        self.white_time_left = rec.prev_white_time_left
+        self.black_time_left = rec.prev_black_time_left
+        self._last_clock_tick = rec.prev_last_clock_tick
+        self._active_clock_side = rec.prev_active_clock_side
+        self.review_mode = rec.prev_review_mode
+        self.game_over_reason = rec.prev_game_over_reason
+        self.game_over_status = rec.prev_game_over_status
+        self.review_selected_index = rec.prev_review_selected_index
+        self.move_history_review = self.move_history_review[: rec.prev_review_len]
+        self.move_san_history = self.move_san_history[: rec.prev_san_len]
+        self._refresh_opening_theory()
 
         self._position_generation += 1
         self._start_analysis()
@@ -405,8 +711,9 @@ class PygameChessGUI:
         # Level 1 is intentionally weak/random.
         if self.difficulty <= 1:
             return 1
-        # Slightly stronger than the raw 1-5 scale.
-        return {2: 3, 3: 4, 4: 5, 5: 6}.get(self.difficulty, self.difficulty)
+        # Map human-friendly 1-5 difficulty into meaningful search depths.
+        # Level 2: low depth; 3: moderate; 4: deep; 5: very deep.
+        return {2: 2, 3: 4, 4: 8, 5: 12}.get(self.difficulty, self.difficulty)
 
     # ------------------------------------------------------------------
     # Engine analysis (suggested moves + eval)
@@ -482,13 +789,18 @@ class PygameChessGUI:
                 best_score_latest = float(score_for_display)
                 depth_latest = int(depth)
 
-            depth = max(3, self._difficulty_to_depth() + 1)
+            depth = max(4, self._difficulty_to_depth() + 2)
+
+            # Analysis can think a bit longer than the move-playing engine since it
+            # runs in the background thread.
+            analysis_time = 0.75 + 0.9 * max(0, (self.difficulty - 1))
+            analysis_time = min(8.0, analysis_time)
 
             try:
                 mg.find_best_move(
                     depth=depth,
                     is_white_turn=(b.turn == "white"),
-                    max_time=1.0,
+                    max_time=analysis_time,
                     verbose=False,
                     on_depth_complete=_on_depth_complete,
                     use_book=True,
@@ -499,8 +811,8 @@ class PygameChessGUI:
             lines: list[tuple[str, float]] = []
             suggested_moves: list[tuple[tuple[int, int], tuple[int, int], str | None, float, str]] = []
             if root_scores_latest:
-                # Keep top 8 moves
-                for (move, score) in root_scores_latest[:8]:
+                # Keep top 10 moves so the review panel can show richer lines.
+                for (move, score) in root_scores_latest[:10]:
                     if move not in legal_set:
                         continue
                     start, end, promo = move
@@ -513,10 +825,10 @@ class PygameChessGUI:
                     lines.append((san, float(score)))
                     suggested_moves.append((start, end, promo, float(score), san))
             else:
-                # Fallback: score a handful of legal moves quickly (still multi-move suggestions).
+                # Fallback: score a larger batch of legal moves quickly (still multi-move suggestions).
                 moves = list(legal_set)
                 scored = []
-                for (start, end, promo) in moves[:20]:
+                for (start, end, promo) in moves[:30]:
                     state = b.make_move(start, end, promo)
                     try:
                         s = float(mg.evaluate_position())
@@ -571,7 +883,7 @@ class PygameChessGUI:
                 self._analysis_best_pv_text = best_pv_text
                 self._analysis_suggested_moves = suggested_moves
                 # Keep multipv display simple/fast/reliable: score + first move SAN.
-                self._analysis_multipv = [(sc, san) for (san, sc) in self._analysis_lines[:6]]
+                self._analysis_multipv = [(sc, san) for (san, sc) in self._analysis_lines[:8]]
 
             with self._analysis_state_lock:
                 self._analysis_thinking = False
@@ -605,6 +917,8 @@ class PygameChessGUI:
 
     def _start_ai_if_needed(self):
         if self._ai_thinking:
+            return
+        if self.game_over_status != "ongoing":
             return
         if self._human_to_move():
             return
@@ -640,7 +954,14 @@ class PygameChessGUI:
 
             depth = self._difficulty_to_depth()
             # Time cap keeps the UI responsive while still letting iterative deepening find tactics.
-            max_time = 0.25 + 0.25 * max(0, (self.difficulty - 1))
+            max_time = 0.25 + 0.75 * max(0, (self.difficulty - 1))
+            if self.difficulty >= 5:
+                max_time = max(max_time, 4.0)
+            clock_side = "white" if ai_is_white else "black"
+            remaining = self._remaining_time_for_side(clock_side)
+            if remaining is not None:
+                clock_budget = max(0.05, remaining / 25.0 + float(self.increment_seconds) * 0.5)
+                max_time = min(max_time, clock_budget)
             best_move, _score = mg.find_best_move(
                 depth=depth,
                 is_white_turn=ai_is_white,
@@ -655,6 +976,8 @@ class PygameChessGUI:
 
     def _consume_ai_move_if_ready(self):
         if self._ai_thinking:
+            return
+        if self.game_over_status != "ongoing":
             return
         if self._ai_best_move is None:
             return
@@ -678,28 +1001,49 @@ class PygameChessGUI:
     # ------------------------------------------------------------------
 
     def _draw_board(self):
-        light = (240, 217, 181)
-        dark = (181, 136, 99)
-        sel = (246, 246, 105)
-        last = (170, 205, 100)
-        legal = (90, 140, 220)
-        best_legal = (245, 200, 60)
-        check = (220, 80, 90)
+        light = (237, 214, 176)
+        dark = (173, 126, 86)
+        sel = (255, 224, 102)
+        last = (132, 191, 125)
+        legal = (102, 157, 255)
+        best_legal = (255, 203, 71)
+        check = (232, 93, 104)
 
-        self.screen.fill((20, 20, 24))
+        # Background wash
+        self.screen.fill((10, 13, 18))
+        bg_top = pygame.Rect(0, 0, self.window_w, self.window_h)
+        pygame.draw.rect(self.screen, (13, 17, 24), bg_top)
+        pygame.draw.circle(self.screen, (28, 41, 64), (self.window_w - 120, 70), 170)
+        pygame.draw.circle(self.screen, (20, 28, 40), (self.window_w - 20, self.board_px + 10), 180)
+
+        # Main board/card container
+        container = pygame.Rect(8, 8, self.window_w - 16, self.board_px - 16)
+        self._draw_card(container, (18, 21, 28), border=(52, 59, 72), radius=24)
+
+        # Header strip
+        header = pygame.Rect(18, 14, self.window_w - 36, 36)
+        pygame.draw.rect(self.screen, (24, 28, 37), header, border_radius=14)
+        title = self.font.render("Rohans Engine", True, (244, 246, 250))
+        self.screen.blit(title, (28, 23))
+        subtitle = self.font_small.render("Analysis dashboard · human vs engine", True, (153, 161, 176))
+        self.screen.blit(subtitle, (28 + title.get_width() + 10, 25))
+        if self.white_time_left is not None and self.black_time_left is not None:
+            clock_text = f"W {self._format_clock(self.white_time_left)}   B {self._format_clock(self.black_time_left)}"
+            clock_surf = self.font_small.render(clock_text, True, (205, 214, 228))
+            self.screen.blit(clock_surf, (self.window_w - clock_surf.get_width() - 28, 25))
 
         # Eval bar
         ratio = self._score_to_ratio(self._analysis_eval)
         eval_rect = pygame.Rect(0, 0, self.eval_w, self.board_px)
-        pygame.draw.rect(self.screen, (20, 20, 24), eval_rect)
+        pygame.draw.rect(self.screen, (18, 21, 28), eval_rect)
         white_h = int(round(self.board_px * ratio))
-        pygame.draw.rect(self.screen, (245, 245, 245), pygame.Rect(0, 0, self.eval_w, white_h))
+        pygame.draw.rect(self.screen, (241, 241, 243), pygame.Rect(0, 0, self.eval_w, white_h))
         pygame.draw.rect(
             self.screen,
-            (10, 10, 10),
+            (8, 8, 10),
             pygame.Rect(0, white_h, self.eval_w, self.board_px - white_h),
         )
-        pygame.draw.rect(self.screen, (45, 48, 56), eval_rect, 1)
+        pygame.draw.rect(self.screen, (58, 65, 77), eval_rect, 1)
 
         # Board squares
         for row in range(8):
@@ -760,7 +1104,12 @@ class PygameChessGUI:
             pygame.draw.rect(self.screen, check, rect, 4)
 
         # Suggested move arrow (only best; gold if "brilliant")
-        if self._analysis_suggested_moves:
+        review_pick = self._selected_review_entry()
+        if review_pick is not None:
+            s, e, _p = review_pick["start"], review_pick["end"], review_pick["promo"]
+            col = (110, 210, 160, 195)
+            self._draw_arrow(s, e, rgba=col, width=10)
+        elif self._analysis_suggested_moves:
             s, e, _p, _sc, _san = self._analysis_suggested_moves[0]
             if self._is_brilliant_best():
                 col = (245, 200, 60, 200)
@@ -809,80 +1158,153 @@ class PygameChessGUI:
         # Sidebar: analysis
         sidebar_x = self.eval_w + self.board_px
         sidebar_rect = pygame.Rect(sidebar_x, 0, self.sidebar_w, self.board_px)
-        pygame.draw.rect(self.screen, (16, 18, 22), sidebar_rect)
-        pygame.draw.rect(self.screen, (45, 48, 56), sidebar_rect, 1)
+        self._draw_card(sidebar_rect, (16, 19, 26), border=(52, 59, 72), radius=24)
+        inner = pygame.Rect(sidebar_x + 12, 12, self.sidebar_w - 24, self.board_px - 24)
+        self._draw_card(inner, (20, 24, 32), border=(44, 51, 63), radius=18)
 
-        title = self.font.render("Analysis", True, (230, 230, 236))
-        self.screen.blit(title, (sidebar_x + 12, 10))
+        self._draw_section_title(sidebar_x + 18, 18, "Analysis")
 
-        depth_text = self.font_small.render(f"depth={self._analysis_depth}", True, (160, 165, 180))
-        self.screen.blit(depth_text, (sidebar_x + self.sidebar_w - depth_text.get_width() - 12, 14))
+        depth_text = self.font_small.render(f"depth {self._analysis_depth}", True, (154, 162, 177))
+        self.screen.blit(depth_text, (sidebar_x + self.sidebar_w - depth_text.get_width() - 18, 20))
 
-        # Normalized eval display in [-1, 1]
         eval_norm = self._score_to_norm(self._analysis_eval)
         eval_norm = max(-1.0, min(1.0, eval_norm))
-        eval_line = self.font_small.render(f"Eval: {eval_norm:+.2f}", True, (170, 175, 190))
-        self.screen.blit(eval_line, (sidebar_x + 12, 38))
-
+        eval_label = f"Eval {eval_norm:+.2f}"
+        eval_line = self.font_small.render(eval_label, True, (233, 236, 241))
+        self.screen.blit(eval_line, (sidebar_x + 18, 44))
         if self._analysis_thinking:
-            note = self.font_small.render("Analyzing…", True, (150, 155, 170))
-            self.screen.blit(note, (sidebar_x + 140, 38))
+            note = self.font_small.render("Analyzing…", True, (124, 174, 255))
+            self.screen.blit(note, (sidebar_x + 120, 44))
 
-        def ellipsize(text: str, max_w: int) -> str:
-            if self.font_small.size(text)[0] <= max_w:
-                return text
-            t = text
-            # Remove characters until it fits.
-            while t and self.font_small.size(t + "…")[0] > max_w:
-                t = t[:-1]
-            return (t + "…") if t else "…"
+        self._draw_eval_meter(sidebar_x + 18, 70, self.sidebar_w - 36, 14, self._analysis_eval)
 
-        y = 66
-        max_w = self.sidebar_w - 24
-        # Best PV (wrapped)
-        if self._analysis_best_pv_text:
-            words = self._analysis_best_pv_text.split(" ")
-            line_words = []
-            for w in words:
-                cand = (" ".join(line_words + [w])).strip()
-                if self.font_small.size(cand)[0] > max_w and line_words:
-                    surf = self.font_small.render(" ".join(line_words), True, (210, 215, 230))
-                    self.screen.blit(surf, (sidebar_x + 12, y))
-                    y += 18
-                    line_words = [w]
-                else:
-                    line_words.append(w)
-            if line_words:
-                surf = self.font_small.render(" ".join(line_words), True, (210, 215, 230))
-                self.screen.blit(surf, (sidebar_x + 12, y))
-                y += 24
+        # Opening theory / book guidance
+        theory_card = pygame.Rect(sidebar_x + 18, 92, self.sidebar_w - 36, 60)
+        self._draw_card(theory_card, (24, 29, 38), border=(62, 70, 84), radius=14)
+        self._draw_section_title(sidebar_x + 28, 100, self._opening_theory_label, accent=(245, 200, 60))
+        theory_lines = [self._opening_theory_detail]
+        if self.move_san_history:
+            theory_lines.append(f"Plies played: {len(self.move_san_history)}")
+        for idx, line_text in enumerate(theory_lines[:2]):
+            surf = self.font_tiny.render(line_text, True, (210, 216, 226))
+            self.screen.blit(surf, (sidebar_x + 28, 120 + idx * 14))
 
-        lines = self._analysis_multipv if self._analysis_multipv else [(sc, san) for (san, sc) in self._analysis_lines[:5]]
-        for idx, (score, move_text) in enumerate(lines[:5], 1):
-            line = f"{self._format_cp(score):>6}  {move_text}"
-            line = ellipsize(line, max_w)
-            color = (235, 235, 240) if idx == 1 else (190, 195, 210)
-            surf = self.font_small.render(line, True, color)
-            self.screen.blit(surf, (sidebar_x + 12, y))
-            y += 22
+        # Best principal variation card
+        pv_card = pygame.Rect(sidebar_x + 18, 160, self.sidebar_w - 36, 86)
+        self._draw_card(pv_card, (27, 32, 41), border=(65, 74, 89), radius=14)
+        self._draw_section_title(sidebar_x + 28, 178, "Best line", accent=(255, 203, 71))
+
+        pv_text = self._analysis_best_pv_text if self._analysis_best_pv_text else "Waiting for engine line…"
+        words = pv_text.split(" ")
+        wrapped: list[str] = []
+        line_words: list[str] = []
+        max_w = self.sidebar_w - 56
+        for w in words:
+            cand = (" ".join(line_words + [w])).strip()
+            if line_words and self.font_small.size(cand)[0] > max_w:
+                wrapped.append(" ".join(line_words))
+                line_words = [w]
+            else:
+                line_words.append(w)
+        if line_words:
+            wrapped.append(" ".join(line_words))
+        for idx, line_text in enumerate(wrapped[:3]):
+            surf = self.font_tiny.render(line_text, True, (227, 231, 239))
+            self.screen.blit(surf, (sidebar_x + 28, 190 + idx * 14))
+
+        # Review or move suggestions
+        sugg_top = 252
+        sugg_card = pygame.Rect(sidebar_x + 18, sugg_top, self.sidebar_w - 36, self.board_px - sugg_top - 18)
+        self._draw_card(sugg_card, (25, 29, 37), border=(63, 72, 87), radius=14)
+        self._review_row_hitboxes = []
+
+        game_status = self.mg.get_game_status()
+        if self.review_mode or game_status["is_over"]:
+            review_card = pygame.Rect(sidebar_x + 18, sugg_top + 8, self.sidebar_w - 36, self.board_px - sugg_top - 26)
+            self._draw_card(review_card, (24, 28, 36), border=(63, 72, 87), radius=14)
+            self._draw_section_title(sidebar_x + 28, sugg_top + 18, "Game review", accent=(112, 255, 189))
+
+            white_acc = self._review_accuracy("white")
+            black_acc = self._review_accuracy("black")
+            result_msg = self.game_over_reason or game_status["message"]
+            result_surf = self.font_tiny.render(result_msg, True, (235, 239, 245))
+            self.screen.blit(result_surf, (sidebar_x + 28, sugg_top + 38))
+
+            counts_white = self._review_counts("white")
+            counts_black = self._review_counts("black")
+
+            stat_box = pygame.Rect(sidebar_x + 24, sugg_top + 56, self.sidebar_w - 48, 70)
+            self._draw_card(stat_box, (20, 24, 32), border=(56, 64, 76), radius=12)
+            stat_lines = [
+                f"Accuracy   W {white_acc:0.1f}   B {black_acc:0.1f}",
+                f"Best {counts_white.get('Best', 0):>2}/{counts_black.get('Best', 0):>2}  Good {counts_white.get('Good', 0):>2}/{counts_black.get('Good', 0):>2}  Miss {counts_white.get('Miss', 0):>2}/{counts_black.get('Miss', 0):>2}",
+                f"Blunder {counts_white.get('Blunder', 0):>2}/{counts_black.get('Blunder', 0):>2}  Inacc {counts_white.get('Inaccuracy', 0):>2}/{counts_black.get('Inaccuracy', 0):>2}",
+            ]
+            for idx, line in enumerate(stat_lines):
+                surf = self.font_tiny.render(line, True, (212, 218, 228))
+                self.screen.blit(surf, (sidebar_x + 34, sugg_top + 70 + idx * 16))
+
+            rows = self._review_rows()
+            list_y = sugg_top + 138
+            list_h = self.board_px - list_y - 20
+            list_card = pygame.Rect(sidebar_x + 24, list_y, self.sidebar_w - 48, list_h)
+            self._draw_card(list_card, (22, 26, 34), border=(56, 64, 76), radius=12)
+            self._draw_section_title(sidebar_x + 34, list_y + 8, "Move by move", accent=(112, 255, 189))
+
+            row_y = list_y + 28
+            row_width = self.sidebar_w - 56
+            visible_rows = rows[-8:]
+            for row in visible_rows:
+                entry = row
+                label = f"{entry['index'] + 1:02d}. {entry['san']}"
+                detail = f"{entry['classification']} {entry['loss_cp']}cp"
+                row_rect = pygame.Rect(sidebar_x + 28, row_y, row_width, 24)
+                self._review_row_hitboxes.append((entry['index'], row_rect))
+                selected = entry['index'] == self.review_selected_index
+                fill = (41, 50, 63) if selected else (29, 33, 41)
+                border = (110, 210, 160) if selected else (58, 64, 76)
+                self._draw_card(row_rect, fill, border=border, radius=8)
+                label_surf = self.font_tiny.render(label, True, (240, 243, 248))
+                detail_surf = self.font_tiny.render(detail, True, (173, 181, 194))
+                self.screen.blit(label_surf, (row_rect.x + 8, row_rect.y + 4))
+                self.screen.blit(detail_surf, (row_rect.right - detail_surf.get_width() - 8, row_rect.y + 4))
+                row_y += 26
+
+            hint = self.font_tiny.render("Click any move row to show it on the board", True, (148, 157, 170))
+            self.screen.blit(hint, (sidebar_x + 28, self.board_px - 20))
+        else:
+            self._draw_section_title(sidebar_x + 28, sugg_top + 8, "Move suggestions", accent=(112, 255, 189))
+
+            lines = self._analysis_multipv if self._analysis_multipv else [(sc, san) for (san, sc) in self._analysis_lines[:8]]
+            if not lines:
+                empty = self.font_small.render("No legal lines available yet.", True, (150, 157, 171))
+                self.screen.blit(empty, (sidebar_x + 28, sugg_top + 34))
+            else:
+                y = sugg_top + 34
+                for idx, (score, move_text) in enumerate(lines[:8], 1):
+                    row_h = self._draw_move_row(sidebar_x + 24, y, self.sidebar_w - 48, move_text, score, idx, selected=(idx == 1))
+                    y += row_h + 8
+                    if y + 34 > self.board_px - 18:
+                        break
 
         # Bottom panel
         panel_rect = pygame.Rect(0, self.board_px, self.window_w, self.panel_h)
-        pygame.draw.rect(self.screen, (16, 18, 22), panel_rect)
+        pygame.draw.rect(self.screen, (12, 15, 20), panel_rect)
+        pygame.draw.line(self.screen, (58, 65, 77), (0, self.board_px), (self.window_w, self.board_px), 1)
 
-        status = self.mg.get_game_status()["message"]
+        status = self.game_over_reason or self.mg.get_game_status()["message"]
         if self._ai_thinking:
             status = status + " — AI thinking…"
         if self.pending_promotion is not None:
             status = "Promotion: press Q/R/B/N"
 
         role = "Human=White" if self.human_plays_white else "Human=Black"
-        help_text = f"{role} | Difficulty {self.difficulty} (1-5) | U=undo | F=flip | R=reset"
+        help_text = f"{role} | Difficulty {self.difficulty} (1-5) | U=undo | F=flip | R=reset | 1-5 switch strength"
 
-        s1 = self.font.render(status, True, (235, 235, 240))
-        s2 = self.font_small.render(help_text, True, (170, 175, 190))
-        self.screen.blit(s1, (10, self.board_px + 10))
-        self.screen.blit(s2, (10, self.board_px + 44))
+        s1 = self.font.render(status, True, (240, 242, 246))
+        s2 = self.font_small.render(help_text, True, (158, 165, 180))
+        self.screen.blit(s1, (16, self.board_px + 10))
+        self.screen.blit(s2, (16, self.board_px + 42))
 
     # ------------------------------------------------------------------
     # Input
@@ -906,6 +1328,15 @@ class PygameChessGUI:
 
     def _handle_click(self, pos):
         if self.pending_promotion is not None:
+            return
+        if self.review_mode or self.game_over_status != "ongoing":
+            for index, rect in self._review_row_hitboxes:
+                if rect.collidepoint(pos):
+                    self._select_review_entry(index)
+                    return
+            if self.review_mode:
+                return
+        if self.game_over_status != "ongoing":
             return
         if not self._human_to_move():
             return
@@ -952,6 +1383,12 @@ class PygameChessGUI:
             self._start_analysis()
             return
 
+        if key == pygame.K_v:
+            self.review_mode = not self.review_mode
+            if self.review_mode and self.move_history_review:
+                self.review_selected_index = len(self.move_history_review) - 1
+            return
+
         if key == pygame.K_u:
             if not self._ai_thinking:
                 self.undo_full_move()
@@ -968,6 +1405,8 @@ class PygameChessGUI:
                 square_size=self.square_size,
                 human_plays_white=self.human_plays_white,
                 difficulty=self.difficulty,
+                time_minutes=self.time_minutes,
+                increment_seconds=self.increment_seconds,
             )
             return
 
@@ -989,6 +1428,7 @@ class PygameChessGUI:
     def run(self):
         running = True
         while running:
+            self._tick_clocks()
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
